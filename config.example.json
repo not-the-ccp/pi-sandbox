@@ -1,0 +1,14 @@
+{
+  "image": "pi-sandbox:latest",
+  "env": {
+    "OPENROUTER_API_KEY": "sk-or-..."
+  },
+  "env_file": [],
+  "mounts": [],
+  "workspace": null,
+  "memory": "4g",
+  "cpus": "2",
+  "pids_limit": 256,
+  "home_volume": "pi-sandbox-home",
+  "extra_args": []
+}

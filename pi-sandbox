@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""pi-sandbox — run PI isolated in rootless podman.
+
+The container IS the permission boundary, so PI gets full tool access inside
+and you never answer permission prompts. The host only ever exposes what
+config.json explicitly allows: one workspace dir + listed mounts + listed env.
+
+Single file, stdlib only. No dependencies to audit.
+
+Usage:
+  pi-sandbox init [--local] [--force]   write an example config
+  pi-sandbox build [--no-cache]         build the image
+  pi-sandbox run [flags] [--] [pi args...]    run pi (execs podman)
+  pi-sandbox exec [flags] [--] CMD [args...]  raw command in same sandbox
+  pi-sandbox show                       print effective config (secrets masked)
+                                        + the exact podman command
+
+One-off run flags (must come FIRST, before `--` or any pi/command arg):
+  --mount SRC[:DST][:ro|rw]   extra mount for this run only (repeatable).
+                              Bare SRC mounts at /mnt/<name>, default ro.
+  --workspace DIR             use DIR as /workspace for this run only.
+  --env KEY=VALUE             extra env for this run only (repeatable).
+  --publish PORT[:CPORT]      expose container port on 127.0.0.1 (repeatable).
+                              e.g. --publish 3000 reaches a dev server at
+                              http://localhost:3000.
+
+Global flags (must come BEFORE the subcommand):
+  --config PATH   use this config file (default: $PI_SANDBOX_CONFIG,
+                  ~/.config/pi-sandbox/config.json, ./config.json)
+  --dry-run       print the podman command instead of executing it
+"""
+
+import json
+import os
+import stat
+import subprocess
+import sys
+
+TOOL_DIR = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_XDG = os.path.expanduser("~/.config/pi-sandbox/config.json")
+LOCAL_CONFIG = os.path.join(TOOL_DIR, "config.json")
+LEGACY_ENV_FILE = os.path.expanduser("~/.config/pi-sandbox/api.env")
+
+COMMANDS = ("init", "build", "run", "exec", "show")
+
+EXAMPLE_CONFIG = {
+    "image": "pi-sandbox:latest",
+    "env": {
+        "OPENROUTER_API_KEY": "sk-or-...",
+    },
+    "env_file": [],
+    "mounts": [
+        # {"src": "~/.ssh", "dst": "/home/agent/.ssh", "mode": "ro"},
+    ],
+    "workspace": None,
+    "memory": "4g",
+    "cpus": "2",
+    "pids_limit": 256,
+    "home_volume": "pi-sandbox-home",
+    "extra_args": [],
+}
+
+# dst inside the container that must never be overlaid by an extra mount
+DST_DENY_EXACT = ("/", "/workspace", "/tmp", "/home/agent")
+DST_DENY_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/etc", "/boot")
+
+
+def die(msg, code=2):
+    print(f"pi-sandbox: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"pi-sandbox: warning: {msg}", file=sys.stderr)
+
+
+def resolve_config_path(explicit):
+    if explicit:
+        return explicit
+    if os.environ.get("PI_SANDBOX_CONFIG"):
+        return os.environ["PI_SANDBOX_CONFIG"]
+    if os.path.isfile(DEFAULT_XDG):
+        return DEFAULT_XDG
+    if os.path.isfile(LOCAL_CONFIG):
+        return LOCAL_CONFIG
+    return DEFAULT_XDG  # whatever the user intended, this is where init puts it
+
+
+def cmd_init(path, local, force):
+    dest = LOCAL_CONFIG if local else (path or DEFAULT_XDG)
+    if os.path.exists(dest) and not force:
+        die(f"{dest} already exists (use --force to overwrite)")
+    cfg = json.loads(json.dumps(EXAMPLE_CONFIG))  # deep copy
+    if os.path.isfile(LEGACY_ENV_FILE):
+        cfg["env_file"] = [LEGACY_ENV_FILE]
+        cfg["env"] = {}
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    with open(dest, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.chmod(dest, 0o600)
+    print(f"wrote {dest} (mode 600) — edit env/mounts, then: pi-sandbox build")
+
+
+def load_config(path):
+    if not os.path.isfile(path):
+        die(f"no config at {path}\nrun: pi-sandbox init")
+    st = os.stat(path)
+    if st.st_mode & (stat.S_IRGRP | stat.S_IROTH):
+        warn(f"{path} is readable by others and may contain API keys — chmod 600 it")
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"{path}: invalid JSON: {e}")
+    if not isinstance(cfg, dict):
+        die(f"{path}: top level must be an object")
+    merged = json.loads(json.dumps(EXAMPLE_CONFIG))
+    for k, v in cfg.items():
+        if k not in merged:
+            warn(f"unknown key {k!r} ignored")
+        else:
+            merged[k] = v
+    return merged
+
+
+def check_env(cfg):
+    env = cfg["env"]
+    if not isinstance(env, dict):
+        die('"env" must be an object of KEY: value')
+    out = []
+    for k, v in sorted(env.items()):
+        if not isinstance(k, str) or not k:
+            die(f'"env" key {k!r} must be a non-empty string')
+        if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+            die(f'"env" value for {k} must be a string/number')
+        out.append((k, str(v)))
+    files = cfg["env_file"]
+    if not isinstance(files, list) or not all(isinstance(p, str) for p in files):
+        die('"env_file" must be a list of paths')
+    resolved_files = []
+    for p in files:
+        rp = os.path.expanduser(p)
+        if not os.path.isfile(rp):
+            die(f'"env_file" not found: {p}')
+        resolved_files.append(rp)
+    return out, resolved_files
+
+
+def validate_one_mount(src, dst, mode, required, label):
+    if not src or not dst:
+        die(f'{label} needs "src" and "dst"')
+    if mode not in ("ro", "rw"):
+        die(f'{label}: mode must be "ro" or "rw"')
+    if not dst.startswith("/"):
+        die(f'{label}: dst must be absolute, got {dst!r}')
+    norm = os.path.normpath(dst)
+    if norm in DST_DENY_EXACT or norm.split("/")[1:2] == [""] or any(
+        norm == p or norm.startswith(p + "/") for p in DST_DENY_PREFIXES
+    ):
+        die(f'{label}: dst {dst!r} would overlay container internals')
+    if not os.path.isabs(src):
+        src = os.path.join(os.getcwd(), src)
+    src = os.path.normpath(src)
+    if src == "/":
+        die(f'{label}: refusing to mount host /')
+    if not os.path.exists(src):
+        if required:
+            die(f'{label}: src does not exist: {src}')
+        warn(f'{label}: src missing, skipping: {src}')
+        return None
+    return (src, norm, mode == "ro")
+
+
+def check_mounts(cfg):
+    mounts = cfg["mounts"]
+    if not isinstance(mounts, list):
+        die('"mounts" must be a list of {src, dst, mode}')
+    out = []
+    for i, m in enumerate(mounts):
+        if not isinstance(m, dict):
+            die(f'"mounts"[{i}] must be an object')
+        r = validate_one_mount(os.path.expanduser(m.get("src", "")),
+                               m.get("dst", ""), m.get("mode", "ro"),
+                               m.get("required", True), f'"mounts"[{i}]')
+        if r is not None:
+            out.append(r)
+    return out
+
+
+def parse_mount_spec(spec):
+    label = f'--mount {spec}'
+    parts = spec.split(":")
+    mode = "ro"
+    if parts and parts[-1] in ("ro", "rw"):
+        mode = parts.pop()
+    if len(parts) == 1:
+        src = parts[0]
+        dst = "/mnt/" + os.path.basename(os.path.normpath(src))
+    elif len(parts) == 2:
+        src, dst = parts
+    else:
+        die(f'{label}: too many colons — use SRC[:DST][:ro|rw]')
+    return validate_one_mount(os.path.expanduser(src), dst, mode, True, label)
+
+
+def parse_port_spec(spec):
+    label = f'--publish {spec}'
+    parts = spec.split(":")
+    if len(parts) == 1:
+        host, cont = parts[0], parts[0]
+    elif len(parts) == 2:
+        host, cont = parts
+    else:
+        die(f'{label}: want PORT[:CPORT]')
+    for p in (host, cont):
+        if not p.isdigit() or not 1 <= int(p) <= 65535:
+            die(f'{label}: bad port {p!r}')
+    # localhost only — never 0.0.0.0: the sandbox serves you, not the LAN.
+    return f"127.0.0.1:{host}:{cont}"
+
+
+RUN_FLAGS = ("--mount", "--workspace", "--env", "--publish")
+
+
+def split_run_flags(rest):
+    """Split run/exec args into (overrides, passthrough).
+    Our flags must come first; anything else (incl. pi flags like -p)
+    ends flag parsing and passes through untouched."""
+    ov = {"mounts": [], "workspace": None, "env": [], "publish": []}
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok in RUN_FLAGS:
+            if i + 1 >= len(rest):
+                die(f'{tok} needs a value')
+            key, val = tok, rest[i + 1]
+            i += 2
+        elif tok.startswith("--") and "=" in tok:
+            key, val = tok.split("=", 1)
+            if key not in RUN_FLAGS:
+                break
+            i += 1
+        else:
+            break
+        if key == "--mount":
+            ov["mounts"].append(parse_mount_spec(val))
+        elif key == "--workspace":
+            ws = os.path.normpath(os.path.expanduser(val))
+            if not os.path.isdir(ws):
+                die(f'--workspace is not a directory: {ws}')
+            ov["workspace"] = ws
+        elif key == "--env":
+            if "=" not in val or not val.split("=", 1)[0]:
+                die(f'--env wants KEY=VALUE, got {val!r}')
+            ov["env"].append(tuple(val.split("=", 1)))
+        elif key == "--publish":
+            ov["publish"].append(parse_port_spec(val))
+    return ov, rest[i:]
+
+
+def check_scalar(cfg, key, typ, default):
+    v = cfg[key]
+    if v is None:
+        return default
+    if not isinstance(v, typ):
+        die(f'"{key}" must be {typ.__name__}')
+    return v
+
+
+def build_podman_cmd(cfg, container_cmd, ov=None):
+    ov = ov or {"mounts": [], "workspace": None, "env": [], "publish": []}
+    env, env_files = check_env(cfg)
+    mounts = check_mounts(cfg)
+    # one-off CLI mounts win over config mounts on the same dst
+    for src, dst, ro in ov["mounts"]:
+        dropped = [m for m in mounts if m[1] == dst]
+        if dropped:
+            warn(f'--mount {dst} overrides config mount')
+        mounts = [m for m in mounts if m[1] != dst]
+        mounts.append((src, dst, ro))
+    # one-off env wins over config env on the same key
+    env = [(k, v) for k, v in env if k not in {k2 for k2, _ in ov["env"]}]
+    for k, v in ov["env"]:
+        if any(k == ek for ek, _ in env):
+            warn(f'--env {k} overrides config env')
+        env.append((k, v))
+
+    image = check_scalar(cfg, "image", str, "pi-sandbox:latest")
+    memory = check_scalar(cfg, "memory", str, "4g")
+    cpus = check_scalar(cfg, "cpus", (str, int, float), "2")
+    pids = check_scalar(cfg, "pids_limit", int, 256)
+    home_vol = check_scalar(cfg, "home_volume", str, "pi-sandbox-home")
+    extra = cfg["extra_args"]
+    if not isinstance(extra, list) or not all(isinstance(a, str) for a in extra):
+        die('"extra_args" must be a list of strings')
+
+    ws = ov["workspace"] or cfg["workspace"]
+    if ws is None:
+        workspace = os.getcwd()
+    else:
+        workspace = os.path.normpath(os.path.expanduser(ws))
+        if not os.path.isdir(workspace):
+            die(f'workspace is not a directory: {workspace}')
+
+    uid, gid = os.getuid(), os.getgid()
+    tty = ["-it"] if sys.stdin.isatty() else ["-i"]
+
+    cmd = [
+        "podman", "run", "--rm", *tty,
+        "--name", f"pi-sandbox-{os.getpid()}",
+        "--userns", "keep-id",
+        "--user", f"{uid}:{gid}",
+        "--hostname", "pi-sandbox",
+        "--ipc", "private", "--pid", "private",
+        "--uts", "private", "--cgroupns", "private",
+        "--cap-drop", "all",
+        "--security-opt", "no-new-privileges",
+        "--pids-limit", str(pids),
+        "--memory", memory, "--cpus", str(cpus),
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
+        "--mount", f"type=bind,src={workspace},dst=/workspace,relabel=private,rw",
+        "--mount", f"type=volume,src={home_vol},dst=/home/agent",
+    ]
+    for src, dst, ro in mounts:
+        cmd += ["--mount",
+                f"type=bind,src={src},dst={dst},relabel=private,ro={str(ro).lower()}"]
+    for pub in ov["publish"]:
+        cmd += ["--publish", pub]
+    for ef in env_files:
+        cmd += ["--env-file", ef]
+    for k, v in env:
+        cmd += ["-e", f"{k}={v}"]
+    if os.environ.get("TERM"):
+        cmd += ["-e", f"TERM={os.environ['TERM']}"]
+    cmd += ["-e", "PI_SANDBOX=1",
+            "--workdir", "/workspace",
+            *extra, image, *container_cmd]
+    return cmd, {"workspace": workspace, "home_volume": home_vol}
+
+
+def ensure_volume(home_vol):
+    r = subprocess.run(["podman", "volume", "exists", home_vol])
+    if r.returncode != 0:
+        subprocess.run(["podman", "volume", "create", home_vol],
+                       check=True, capture_output=True)
+
+
+def cmd_build(cfg, no_cache):
+    image = check_scalar(cfg, "image", str, "pi-sandbox:latest")
+    containerfile = os.path.join(TOOL_DIR, "Containerfile")
+    cmd = ["podman", "build", "-t", image, "-f", containerfile]
+    if no_cache:
+        cmd.append("--no-cache")
+    cmd.append(TOOL_DIR)
+    print("+ " + " ".join(cmd), file=sys.stderr)
+    subprocess.run(cmd, check=True)
+
+
+def cmd_show(cfg):
+    probe = list(cfg.get("env", {}).keys())
+    print(f"# config masks {len(probe)} env value(s): {', '.join(sorted(probe)) or '(none)'}")
+    cmd, info = build_podman_cmd(cfg, ["pi"])
+    print(f"# workspace: {info['workspace']}")
+    print("# podman command (exec'd verbatim, secrets redacted):")
+    redacted = []
+    skip = False
+    prev = ""
+    for a in cmd:
+        if skip:
+            redacted.append("***" if prev == "-e" else a)
+            skip = False
+        elif a in ("-e", "--env-file"):
+            redacted.append(a)
+            prev = a
+            skip = True
+        else:
+            redacted.append(a)
+    print(" ".join(redacted))
+
+
+def main():
+    argv = sys.argv[1:]
+    config_explicit = None
+    dry_run = False
+    while argv and argv[0].startswith("--"):
+        opt = argv.pop(0)
+        if opt == "--config":
+            if not argv:
+                die("--config needs a path")
+            config_explicit = argv.pop(0)
+        elif opt.startswith("--config="):
+            config_explicit = opt.split("=", 1)[1]
+        elif opt == "--dry-run":
+            dry_run = True
+        elif opt in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        else:
+            die(f"unknown global flag {opt} (global flags go before the subcommand)")
+    if not argv or argv[0] in ("-h", "--help", "help") or argv[0] not in COMMANDS:
+        print(__doc__.strip())
+        sys.exit(0 if not argv or argv[0] in ("-h", "--help", "help") else 2)
+    command, rest = argv[0], argv[1:]
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+
+    if command == "init":
+        local = "--local" in rest
+        force = "--force" in rest
+        cmd_init(config_explicit, local, force)
+        return
+
+    cfg = load_config(resolve_config_path(config_explicit))
+
+    if command == "build":
+        if dry_run:
+            print("dry-run: build not executed")
+            return
+        cmd_build(cfg, "--no-cache" in rest)
+    elif command == "show":
+        cmd_show(cfg)
+    elif command in ("run", "exec"):
+        ov, rest = split_run_flags(rest)
+        container_cmd = ["pi", *rest] if command == "run" else (rest or ["bash"])
+        cmd, info = build_podman_cmd(cfg, container_cmd, ov)
+        ensure_volume(info["home_volume"])
+        if dry_run or command == "show":
+            print(" ".join(cmd))
+            return
+        os.execvp("podman", cmd)
+
+
+if __name__ == "__main__":
+    main()
