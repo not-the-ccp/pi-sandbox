@@ -1,9 +1,10 @@
 # Podman-safe container for PI (https://pi.dev)
-# Base: Arch to match host distro family. Any distro works — isolation comes
-# from the podman flags in ./pi-sandbox, not from what's inside.
 FROM archlinux:latest
 
-RUN pacman -Syu --noconfirm \
+RUN printf '%s\n' \
+      'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' \
+      > /etc/pacman.d/mirrorlist \
+    && pacman -Syu --noconfirm --disable-download-timeout --needed \
       base-devel \
       git github-cli \
       python python-pip \
